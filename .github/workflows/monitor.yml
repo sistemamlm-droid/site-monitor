@@ -1,0 +1,38 @@
+name: Site Monitor
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # 06:00 UTC ежедневно = 09:00 по Москве. Меняйте под себя.
+  workflow_dispatch:        # позволяет запускать вручную кнопкой в GitHub
+
+permissions:
+  contents: write            # чтобы Action мог сохранить обновлённое состояние обратно в репозиторий
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Установка зависимостей
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Запуск проверки
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python monitor.py
+
+      - name: Сохранить новое состояние в репозиторий
+        run: |
+          git config user.name "site-monitor-bot"
+          git config user.email "actions@github.com"
+          git add state/
+          git diff --cached --quiet || git commit -m "update snapshot $(date +'%Y-%m-%d')"
+          git push
