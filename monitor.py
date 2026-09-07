@@ -11,6 +11,7 @@ import os
 import re
 import json
 import time
+import difflib
 import hashlib
 from urllib.parse import urljoin, urlparse
 from xml.etree import ElementTree as ET
@@ -37,6 +38,25 @@ PAGE_TIMEOUT_MS = 30000        # таймаут загрузки одной ст
 
 # Регулярка для цен в рублях, например: "1 990 руб", "2490руб", "999 ₽"
 PRICE_RE = re.compile(r"\d[\d\s]{1,9},?\d*\s?(?:руб|₽|RUB)", re.IGNORECASE)
+
+# Страница считается "карточкой товара", если её адрес содержит один из этих кусков.
+# Только на таких страницах проверяются цена и текст. На остальных (каталог,
+# листинги, разделы) отслеживается только факт появления новой страницы.
+PRODUCT_URL_MARKERS = ["/product/"]
+
+# Блоки с этими словами в class/id считаются "шумом" и вырезаются перед сравнением
+# текста: рекомендации, слайдеры, отзывы, счётчики просмотров и т.п. — то, что
+# меняется само по себе, без реальной правки карточки.
+NOISE_KEYWORDS = [
+    "nav", "footer", "header", "menu", "cookie", "banner", "slider", "carousel",
+    "recommend", "viewed", "related", "similar", "popular", "social", "share",
+    "chat", "widget", "subscribe", "newsletter", "breadcrumb", "review", "rating",
+    "comment", "compare", "wishlist", "favorite", "cart", "counter",
+]
+
+# Насколько текст карточки должен отличаться, чтобы считаться реальным изменением.
+# 1.0 = тексты идентичны. 0.95 означает "разрешаем" до ~5% технических отличий.
+CONTENT_SIMILARITY_THRESHOLD = 0.95
 
 # =======================================================================
 
@@ -132,11 +152,58 @@ def crawl_links(start_url, browser, limit):
 
 
 def clean_text(html):
+    """Полный текст страницы (используется только для обхода по ссылкам)."""
     soup = BeautifulSoup(html, "lxml")
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
     text = soup.get_text(" ", strip=True)
     return re.sub(r"\s+", " ", text)
+
+
+def is_product_url(url):
+    return any(marker in url for marker in PRODUCT_URL_MARKERS)
+
+
+def get_core_text(html):
+    """Текст страницы БЕЗ шумных блоков (рекомендации, шапка/подвал, отзывы и т.п.) —
+    используется для сравнения карточек товаров, чтобы не ловить ложные срабатывания."""
+    soup = BeautifulSoup(html, "lxml")
+    for tag in soup(["script", "style", "noscript", "svg", "iframe"]):
+        tag.decompose()
+    for el in soup.find_all(True):
+        classes = " ".join(el.get("class", []) or [])
+        el_id = el.get("id", "") or ""
+        attrs = (classes + " " + el_id).lower()
+        if any(keyword in attrs for keyword in NOISE_KEYWORDS):
+            el.decompose()
+    main = soup.find("main") or soup.body or soup
+    text = main.get_text(" ", strip=True)
+    return re.sub(r"\s+", " ", text)
+
+
+def text_similarity(old_text, new_text):
+    if not old_text or not new_text:
+        return 0.0
+    return difflib.SequenceMatcher(None, old_text, new_text).quick_ratio()
+
+
+def diff_snippet(old_text, new_text, max_len=200):
+    """Возвращает короткий фрагмент 'было / стало' — первое найденное отличие."""
+    sm = difflib.SequenceMatcher(None, old_text, new_text)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            continue
+        old_part = old_text[i1:i2].strip()
+        new_part = new_text[j1:j2].strip()
+        if not old_part and not new_part:
+            continue
+        parts = []
+        if old_part:
+            parts.append(f"было: «{old_part[:max_len]}»")
+        if new_part:
+            parts.append(f"стало: «{new_part[:max_len]}»")
+        return " / ".join(parts)
+    return ""
 
 
 def extract_prices(text):
@@ -188,14 +255,23 @@ def main():
             html = fetch_rendered(url, browser)
             if not html:
                 continue
-            text = clean_text(html)
-            text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
-            prices = extract_prices(text)
 
+            product = is_product_url(url)
             page_state_path = os.path.join(STATE_DIR, f"page_{url_key(url)}.json")
             prev = load_json(page_state_path, None)
 
-            if prev is not None and prev["hash"] != text_hash:
+            if not product:
+                # Каталог/листинг/разделы: контент не сравниваем (слишком шумно —
+                # порядок и набор товаров на витрине меняется сам по себе).
+                # Только фиксируем факт посещения, чтобы находить новые страницы.
+                save_json(page_state_path, {"visited": True})
+                time.sleep(REQUEST_DELAY)
+                continue
+
+            core_text = get_core_text(html)
+            prices = extract_prices(core_text)
+
+            if prev is not None:
                 old_prices = set(prev.get("prices", []))
                 new_prices_set = set(prices)
                 if old_prices != new_prices_set:
@@ -206,10 +282,17 @@ def main():
                         changes_report.append(f"   было: {', '.join(removed)}")
                     if added:
                         changes_report.append(f"   стало: {', '.join(added)}")
-                else:
-                    changes_report.append(f"✏️ Изменение контента: {url}")
+                elif "text" in prev:
+                    # Цена не менялась — проверяем сам текст карточки,
+                    # но только если отличия существенные (не техническая мелочь).
+                    similarity = text_similarity(prev["text"], core_text)
+                    if similarity < CONTENT_SIMILARITY_THRESHOLD:
+                        changes_report.append(f"✏️ Изменение текста карточки: {url}")
+                        snippet = diff_snippet(prev["text"], core_text)
+                        if snippet:
+                            changes_report.append(f"   {snippet}")
 
-            save_json(page_state_path, {"hash": text_hash, "prices": prices})
+            save_json(page_state_path, {"text": core_text, "prices": prices})
             time.sleep(REQUEST_DELAY)
 
         browser.close()
