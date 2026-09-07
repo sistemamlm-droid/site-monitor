@@ -171,6 +171,9 @@ def get_core_text(html):
     for tag in soup(["script", "style", "noscript", "svg", "iframe"]):
         tag.decompose()
     for el in soup.find_all(True):
+        if el.attrs is None:
+            # Элемент уже удалён вместе с родительским "шумным" блоком выше по циклу
+            continue
         classes = " ".join(el.get("class", []) or [])
         el_id = el.get("id", "") or ""
         attrs = (classes + " " + el_id).lower()
