@@ -31,10 +31,12 @@ SITEMAP_CANDIDATES = [
     "https://ru.siberianhealth.com/sitemap_index.xml",
 ]
 
-STATE_DIR = "state"           # папка, где хранится "память" о прошлом состоянии
-MAX_PAGES = 150                # лимит страниц за один прогон (чтобы не превышать лимиты)
-REQUEST_DELAY = 1.0            # пауза между запросами, сек (вежливость к серверу)
-PAGE_TIMEOUT_MS = 30000        # таймаут загрузки одной страницы
+STATE_DIR = "state"            # папка, где хранится "память" о прошлом состоянии
+MAX_CRAWL_PAGES = 300           # лимит для обхода по ссылкам (только если sitemap не найден)
+MAX_RENDER_PAGES = 150          # сколько товарных страниц в день открывать браузером для проверки цены/текста
+REQUEST_DELAY = 1.0             # пауза между запросами, сек (вежливость к серверу)
+PAGE_TIMEOUT_MS = 30000         # таймаут загрузки одной страницы
+RENDER_WAIT_MS = 4000           # доп. пауза после загрузки, чтобы JS-цена успела отрисоваться
 
 # Регулярка для цен в рублях, например: "1 990 руб", "2490руб", "999 ₽"
 PRICE_RE = re.compile(r"\d[\d\s]{1,9},?\d*\s?(?:руб|₽|RUB)", re.IGNORECASE)
@@ -104,12 +106,31 @@ def _parse_sitemap(sitemap_url, seen):
     return urls
 
 
+def discover_sitemaps_from_robots():
+    """Некоторые сайты держат sitemap не по стандартному адресу — но всегда
+    честно указывают его в robots.txt строкой 'Sitemap: ...'. Читаем оттуда,
+    чтобы не гадать вручную."""
+    robots_url = f"https://{DOMAIN}/robots.txt"
+    try:
+        r = requests.get(robots_url, headers=HEADERS, timeout=15)
+        r.raise_for_status()
+    except Exception:
+        return []
+    found = []
+    for line in r.text.splitlines():
+        line = line.strip()
+        if line.lower().startswith("sitemap:"):
+            found.append(line.split(":", 1)[1].strip())
+    return found
+
+
 def try_sitemap_urls():
     urls = []
     seen = set()
-    for sm in SITEMAP_CANDIDATES:
+    candidates = SITEMAP_CANDIDATES + discover_sitemaps_from_robots()
+    for sm in dict.fromkeys(candidates):  # убираем дубли, сохраняя порядок
         urls.extend(_parse_sitemap(sm, seen))
-    return urls
+    return list(dict.fromkeys(urls))
 
 
 def fetch_rendered(url, browser):
@@ -118,7 +139,7 @@ def fetch_rendered(url, browser):
     html = ""
     try:
         page.goto(url, timeout=PAGE_TIMEOUT_MS, wait_until="domcontentloaded")
-        page.wait_for_timeout(2500)  # даём время догрузиться JS-контенту
+        page.wait_for_timeout(RENDER_WAIT_MS)  # даём время догрузиться JS-контенту (в т.ч. цене)
         html = page.content()
     except Exception as e:
         print(f"Не удалось загрузить {url}: {e}")
@@ -210,7 +231,15 @@ def diff_snippet(old_text, new_text, max_len=200):
 
 
 def extract_prices(text):
-    return sorted(set(PRICE_RE.findall(text)))
+    """Числа, похожие на цену. Отбрасываем '0 руб'/'0 ₽' — это почти всегда
+    заглушка до того, как JS успел подставить реальную цену, а не сама цена."""
+    raw = PRICE_RE.findall(text)
+    prices = []
+    for p in raw:
+        digits_only = re.sub(r"\D", "", p)
+        if digits_only and int(digits_only) > 0:
+            prices.append(p)
+    return sorted(set(prices))
 
 
 def url_key(url):
@@ -234,42 +263,47 @@ def main():
     known_urls = set(load_json(known_urls_path, []))
     is_first_run = len(known_urls) == 0
 
+    # Шаг 1: находим ВСЕ страницы сайта. Это лёгкая операция (без браузера),
+    # поэтому здесь можно охватить хоть тысячи адресов — это даёт полное
+    # покрытие для поиска новых страниц.
+    all_urls = try_sitemap_urls()
+    all_urls = [u for u in all_urls if urlparse(u).netloc == DOMAIN]
+
+    changes_report = []
+
     with sync_playwright() as p:
         browser = p.chromium.launch()
 
-        current_urls = try_sitemap_urls()
-        current_urls = [u for u in current_urls if urlparse(u).netloc == DOMAIN]
+        if not all_urls:
+            print("sitemap.xml не найден (в т.ч. через robots.txt), обхожу сайт по ссылкам...")
+            all_urls = crawl_links(BASE_URL, browser, MAX_CRAWL_PAGES)
 
-        if not current_urls:
-            print("sitemap.xml не найден, обхожу сайт по ссылкам...")
-            current_urls = crawl_links(BASE_URL, browser, MAX_PAGES)
-
-        current_urls = current_urls[:MAX_PAGES]
-        current_set = set(current_urls)
-
-        changes_report = []
-
+        current_set = set(all_urls)
         new_pages = current_set - known_urls
         if not is_first_run and new_pages:
             changes_report.append("🆕 Новые страницы:")
             changes_report.extend(f"— {u}" for u in sorted(new_pages))
 
-        for url in current_urls:
+        # Шаг 2: открываем браузером только страницы товаров, чтобы проверить
+        # цену и текст. Это дорогая операция, поэтому ограничена по количеству
+        # в день. Если товаров больше лимита — каждый день проверяется свой
+        # "срез" по кругу, так что за несколько дней проверяются все.
+        product_urls = [u for u in all_urls if is_product_url(u)]
+        if product_urls:
+            day_index = int(time.strftime("%j"))  # день года, 1..366
+            start = (day_index * MAX_RENDER_PAGES) % len(product_urls)
+            rotated = product_urls[start:] + product_urls[:start]
+        else:
+            rotated = []
+        urls_to_render = rotated[:MAX_RENDER_PAGES]
+
+        for url in urls_to_render:
             html = fetch_rendered(url, browser)
             if not html:
                 continue
 
-            product = is_product_url(url)
             page_state_path = os.path.join(STATE_DIR, f"page_{url_key(url)}.json")
             prev = load_json(page_state_path, None)
-
-            if not product:
-                # Каталог/листинг/разделы: контент не сравниваем (слишком шумно —
-                # порядок и набор товаров на витрине меняется сам по себе).
-                # Только фиксируем факт посещения, чтобы находить новые страницы.
-                save_json(page_state_path, {"visited": True})
-                time.sleep(REQUEST_DELAY)
-                continue
 
             core_text = get_core_text(html)
             prices = extract_prices(core_text)
